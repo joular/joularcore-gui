@@ -1583,6 +1583,8 @@ dependencies = [
 [[package]]
 name = "joularcore"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ba4d8912e60d2e3cc4f59eadac7dbcf5f087dad4bbd6d1d6570bee44a899425"
 dependencies = [
  "anyhow",
  "axum",

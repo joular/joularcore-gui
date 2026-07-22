@@ -22,7 +22,7 @@ default = ["api"]
 api = ["joularcore/api", "dep:axum", "dep:tokio"]
 
 [dependencies]
-joularcore = { path = "../joularcore" }
+joularcore = "0.1.0"
 clap = { version = "4.6.3", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "color", "suggestions"] }
 eframe = { version = "0.35.0", default-features = false, features = ["wgpu", "x11", "wayland"] }
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
