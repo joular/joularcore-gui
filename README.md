@@ -4,6 +4,32 @@
 
 This is a graphical program that uses [Joular Core](https://github.com/joular/joularcore) library to monitor energy on all platforms and operating systems.
 
+---
+
+## Screenshots
+
+#### GUI — Windows, macOS, Linux, Raspberry Pi
+
+<img src="img/gui-windows-1.png" width="250">
+    
+<img src="img/gui-windows-2.png" width="250">
+
+<img src="img/gui-windows-3.png" width="250">
+
+<img src="img/new-gui-macos-1.png" width="250">
+    
+<img src="img/new-gui-macos-2.png" width="250">
+
+<img src="img/new-gui-linux-1.png" width="250">
+    
+<img src="img/new-gui-linux-2.png" width="250">
+
+<img src="img/joularcore-rpi1.png" width="250">
+    
+<img src="img/joularcore-rpi2.png" width="250">
+
+---
+
 ## 📜 License
 
 Joular Core GUI is licensed under the GNU General Public License 3 license only (GPL-3.0-only).
