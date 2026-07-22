@@ -1,0 +1,31 @@
+[package]
+name = "joularcore-gui"
+version = "0.1.0"
+edition = "2024"
+authors = ["Adel Noureddine"]
+license = "GPL-3.0-only"
+repository = "https://github.com/joular/joularcore"
+description = "Joular Core GUI is an graphical-interface using Joular Core library to measure power and energy across all systems, OSes and devices"
+
+[[bin]]
+name = "joularcoregui"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[features]
+default = ["api"]
+api = ["joularcore/api", "dep:axum", "dep:tokio"]
+
+[dependencies]
+joularcore = { path = "../joularcore" }
+clap = { version = "4.6.3", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "color", "suggestions"] }
+eframe = { version = "0.35.0", default-features = false, features = ["wgpu", "x11", "wayland"] }
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+axum = { version = "0.8.9", optional = true, default-features = false, features = ["tokio", "http1", "json", "ws"] }
+tokio = { version = "1.53.1", optional = true, default-features = false, features = ["rt-multi-thread", "net", "sync"] }
