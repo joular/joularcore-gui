@@ -11,11 +11,12 @@
 
 #![windows_subsystem = "windows"]
 
+pub mod args;
 pub mod gui;
+pub mod session;
 
+use args::Args;
 use clap::Parser;
-use joularcore::{args::Args, common, logging, monitor::JoularCoreMonitor};
-
 
 use std::time::Duration;
 
@@ -23,68 +24,48 @@ const CPU_IDLE_CALIBRATION_SAMPLES: usize = 5;
 const CPU_IDLE_CALIBRATION_INTERVAL_SECS: u64 = 1;
 
 fn main() {
-    logging::init();
+    let args = Args::parse();
 
-    let mut args = Args::parse();
+    // The library prints nothing on its own; it emits `log` records. Without a
+    // logger installed, "RAPL is not readable" and friends are discarded, and a
+    // sensor that reports nothing does so without explanation.
+    //
+    // `windows_subsystem = "windows"` means this binary has no console on
+    // Windows, so these records only reach a terminal on Linux and macOS. The
+    // Monitor screen's warning banner is what tells a Windows user that a
+    // sensor is unreadable.
+    env_logger::Builder::new()
+        .filter_level(args.log_level())
+        .parse_default_env()
+        .init();
 
-    #[cfg(not(feature = "api"))]
-    if args.api_port.is_some() {
-        logging::print_error(
-            "--api-port is unavailable because this binary was compiled without the API feature",
-        );
-        std::process::exit(2);
-    }
-
-    // Force GUI mode to ensure logic consistent with GUI expectations (though we run run_gui directly below)
-    args.gui = true;
-
-    // Initialize platform logic and other components (VM, API, etc.)
-    let ctx = common::setup_joularcore(&args);
-    let common::JoularContext {
-        cpu_energy,
-        gpu_energy,
-        platform,
-        ringbuffer,
-        api_sender,
-        api_shutdown_tx,
-    } = ctx;
-    let cpu_usage = platform.cpu_usage();
-    let process_util = platform.process_cpu_usage();
-    let app_util =
-        platform.app_cpu_usage(std::time::Duration::from_secs(args.app_refresh_interval));
-
-    let mut monitor = JoularCoreMonitor::new(
-        platform,
-        cpu_energy,
-        gpu_energy,
-        cpu_usage,
-        process_util,
-        app_util,
-        args.cpu_idle_baseline,
-    );
+    let mut config = args.config();
+    let mut monitor = session::build_monitor(&config);
 
     if args.calibrate_cpu_idle_baseline {
         eprintln!(
-            "Calibrating CPU idle baseline for the GUI over {} seconds. Keep the machine idle.",
-            CPU_IDLE_CALIBRATION_SAMPLES
+            "Calibrating CPU idle baseline for the GUI over {CPU_IDLE_CALIBRATION_SAMPLES} seconds. Keep the machine idle."
         );
-        let baseline = monitor.calibrate_cpu_idle_baseline(
+
+        match monitor.calibrate_cpu_idle_baseline(
             CPU_IDLE_CALIBRATION_SAMPLES,
             Duration::from_secs(CPU_IDLE_CALIBRATION_INTERVAL_SECS),
-        );
-        eprintln!("Calibrated CPU idle baseline: {:.2} W", baseline);
+        ) {
+            Ok(baseline) => {
+                eprintln!("Calibrated CPU idle baseline: {baseline:.2} W");
+                // Calibration set the baseline on this monitor, but the GUI
+                // builds a new one whenever a build-time setting changes.
+                // Recording it in the config is what carries it across.
+                config.cpu_idle_baseline = Some(baseline);
+            }
+            // A failed calibration leaves the previous baseline in place, so
+            // the GUI is still usable — say so and carry on rather than exit.
+            Err(e) => eprintln!("Failed to calibrate CPU idle baseline: {e}"),
+        }
     }
 
     // Run the GUI directly
-    if let Err(e) = gui::run_gui(
-        monitor,
-        ringbuffer,
-        api_sender,
-        api_shutdown_tx,
-        args.app_refresh_interval,
-        args.api_port,
-        args.api_allowed_origins.clone(),
-    ) {
-        logging::print_error(&format!("Failed to launch Joular Core GUI: {}", e));
+    if let Err(e) = gui::run_gui(monitor, config, args) {
+        eprintln!("Failed to launch Joular Core GUI: {e}");
     }
 }

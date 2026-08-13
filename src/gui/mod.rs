@@ -9,11 +9,9 @@
  * Author : Adel Noureddine
  */
 
-use joularcore::Component;
-use joularcore::common::{ApiSender, ApiShutdownTx};
+use crate::args::Args;
 use joularcore::monitor::JoularCoreMonitor;
-use joularcore::output::{OutputBundle, OutputSink};
-use joularcore::ringbuffer::RingBufferWriter;
+use joularcore::{Component, MonitorConfig, OutputBundle, OutputSink, Target};
 pub mod history;
 pub mod model;
 pub mod theme;
@@ -42,9 +40,16 @@ pub struct PowerGui {
     pub total_power: f64,
     pub cpu_usage: f64,
 
-    // Process/App specific values
-    pub process_power: Option<f64>,
-    pub app_power: Option<(f64, usize)>,
+    // Power attributed to the PID or app being targeted, and how many PIDs
+    // that app matched at sample time.
+    pub target_power: Option<f64>,
+    pub app_pid_count: Option<usize>,
+
+    // A sensor that cannot be read reports `None` rather than 0.0, so an
+    // unreadable sensor is never mistaken for an idle machine. The gauges still
+    // show 0.00 W; these drive the warning banner that explains why.
+    pub cpu_unavailable: bool,
+    pub gpu_unavailable: bool,
 
     // Historical data
     pub cpu_power_history: History,
@@ -56,6 +61,13 @@ pub struct PowerGui {
 
     // Energy trackers
     pub monitor: JoularCoreMonitor,
+
+    /// What `monitor` was actually built from.
+    pub built_config: MonitorConfig,
+    /// What the Options screen is currently asking for. Applied on Start:
+    /// target, component and baseline are set on the running monitor, while
+    /// `app_match`, `app_refresh_interval` and `elevation` need a new one.
+    pub pending_config: MonitorConfig,
 
     // State
     pub state: ValidationState,
@@ -83,24 +95,19 @@ pub struct PowerGui {
     // Outputs
     pub outputs: OutputBundle,
     pub monitoring_active: bool,
+    /// A sink that failed mid-session — a CSV file that can no longer be
+    /// written, most likely. Shown in the Monitor view.
+    pub output_error: Option<String>,
 
     // Display & attribution settings (mirrors -c/--component and --cpu-idle-baseline)
     pub component_filter: Option<Component>,
     pub cpu_idle_baseline_input: String,
 
-    // Ring buffer & API toggles (mirrors -r/--ringbuffer and --api-port).
-    // The `*_committed` flags track whether the corresponding resource has
-    // already been created during this GUI session — once committed the
-    // backing thread / mmap stays for the rest of the run.
+    // Ring buffer toggle (mirrors -r/--ringbuffer). Sinks cannot be detached
+    // from an `OutputBundle`, so the bundle is rebuilt on every Start and
+    // `ringbuffer_active` simply records whether this session has one.
     pub ringbuffer_enabled: bool,
-    pub ringbuffer_committed: bool,
-    pub api_enabled: bool,
-    pub api_committed: bool,
-    pub api_port_input: String,
-    pub api_origin_input: String,
-    pub api_allowed_origins: Vec<String>,
-    /// Oneshot sender used to gracefully shut down the API server thread.
-    pub api_shutdown_tx: ApiShutdownTx,
+    pub ringbuffer_active: bool,
 
     // Whether the Advanced card is expanded. Closed by default.
     pub advanced_open: bool,
@@ -111,28 +118,24 @@ pub struct PowerGui {
 }
 
 impl PowerGui {
-    pub fn new(
-        monitor: JoularCoreMonitor,
-        ringbuffer: Option<RingBufferWriter>,
-        api_sender: ApiSender,
-        api_shutdown_tx: ApiShutdownTx,
-        app_refresh_interval: u64,
-        initial_api_port: Option<u16>,
-        initial_allowed_origins: Vec<String>,
-    ) -> Self {
-        let ringbuffer_committed = ringbuffer.is_some();
-        let api_committed = api_sender.is_some();
-        let api_port_input = initial_api_port.map(|p| p.to_string()).unwrap_or_default();
-
-        let outputs = OutputBundle::new(None, false, ringbuffer, api_sender);
+    pub fn new(monitor: JoularCoreMonitor, config: MonitorConfig, args: &Args) -> Self {
+        // Command line flags seed the Options screen rather than starting a
+        // session: the user still presses Start.
+        let (monitor_mode, pid_input, app_input) = match (args.pid, &args.app) {
+            (Some(pid), _) => (MonitorMode::Pid, pid.to_string(), String::new()),
+            (_, Some(app)) => (MonitorMode::App, String::new(), app.clone()),
+            _ => (MonitorMode::Cpu, String::new(), String::new()),
+        };
 
         let mut gui = Self {
             cpu_power: 0.0,
             gpu_power: 0.0,
             total_power: 0.0,
             cpu_usage: 0.0,
-            process_power: None,
-            app_power: None,
+            target_power: None,
+            app_pid_count: None,
+            cpu_unavailable: false,
+            gpu_unavailable: false,
 
             cpu_power_history: History::new(MAX_HISTORY_LEN),
             gpu_power_history: History::new(MAX_HISTORY_LEN),
@@ -143,39 +146,41 @@ impl PowerGui {
 
             monitor,
 
+            built_config: config.clone(),
+
             state: ValidationState::Options,
             initialized: false,
             last_update: Instant::now(),
 
-            monitor_mode: MonitorMode::Cpu,
-            csv_enabled: false,
-            csv_path: None,
-            csv_overwrite: false,
+            monitor_mode,
+            csv_enabled: args.file.is_some(),
+            csv_path: args.file.clone(),
+            csv_overwrite: args.overwrite,
             system: System::new_all(),
             pids_list: Vec::new(),
             apps_list: Vec::new(),
-            app_refresh_interval,
+            app_refresh_interval: config.app_refresh_interval.as_secs(),
 
-            pid_input: String::new(),
-            app_input: String::new(),
+            pid_input,
+            app_input,
             pid_suggestions_open: false,
             app_suggestions_open: false,
             error_message: None,
 
-            outputs,
+            outputs: OutputBundle::new(),
             monitoring_active: false,
+            output_error: None,
 
-            component_filter: None,
-            cpu_idle_baseline_input: String::new(),
+            component_filter: config.component,
+            cpu_idle_baseline_input: config
+                .cpu_idle_baseline
+                .map(|b| format!("{b:.2}"))
+                .unwrap_or_default(),
 
-            ringbuffer_enabled: ringbuffer_committed,
-            ringbuffer_committed,
-            api_enabled: api_committed,
-            api_committed,
-            api_port_input,
-            api_origin_input: String::new(),
-            api_allowed_origins: initial_allowed_origins,
-            api_shutdown_tx,
+            ringbuffer_enabled: args.ringbuffer,
+            ringbuffer_active: false,
+
+            pending_config: config,
 
             advanced_open: false,
 
@@ -226,9 +231,14 @@ impl PowerGui {
 
     fn app_exists(&mut self, app_name: &str) -> bool {
         self.system.refresh_processes(ProcessesToUpdate::All, true);
+        let app_match = self.pending_config.app_match;
+        // Matched the way the library will match it while measuring, so a
+        // session that starts is one that can actually attribute power.
         self.system.processes().values().any(|proc| {
-            let name = proc.name().to_string_lossy();
-            name == app_name || name.contains(app_name)
+            if proc.thread_kind().is_some() {
+                return false;
+            }
+            crate::args::matches_app_name(&proc.name().to_string_lossy(), app_name, app_match)
         })
     }
 
@@ -241,51 +251,48 @@ impl PowerGui {
 
     fn update_values(&mut self) {
         if !self.initialized {
-            // Get and discard the first data
-            self.monitor.loop_init();
+            // Power and utilization are both counter deltas, so the first
+            // reading only establishes a baseline. Take and discard it.
+            self.monitor.prime();
 
-            // Initialize trackers if selected
-            // We can do a dummy poll or just let it naturally happen in next check
-            // logic below handles initialization implicitly by calling poll
+            // Starting a session creates a tracker with no history either, and
+            // its first attribution sample is a baseline in the same way. Burn
+            // it here so the first figure the user sees is a real one rather
+            // than 0.00 W.
+            if !matches!(self.built_config.target, Target::System) {
+                self.monitor.poll();
+            }
 
             self.initialized = true;
             return;
         }
 
-        // Prepare monitor arguments
-        let mut pid_arg = None;
-        let mut app_arg = None;
+        // Target and component are state on the monitor, set once when the
+        // session started — the sensor a component filter excludes is not read.
+        let sample = self.monitor.poll();
 
-        if self.monitor_mode == MonitorMode::Pid {
-            if let Ok(pid) = self.pid_input.parse::<u32>() {
-                pid_arg = Some(pid);
-            }
-        } else if self.monitor_mode == MonitorMode::App && !self.app_input.is_empty() {
-            app_arg = Some(self.app_input.as_str());
-        }
-
-        // Poll monitor — pass through the component filter so the unused
-        // sensor (CPU or GPU) isn't read at all in the steady-state loop.
-        let sample = self
-            .monitor
-            .poll(pid_arg, app_arg, self.component_filter.as_ref());
+        // A sensor that could not be read is `None`, not 0.0. The gauges show
+        // 0.00 W either way; the flags are what let the Monitor view say why.
+        self.cpu_unavailable = sample.cpu_power.is_none();
+        self.gpu_unavailable = sample.gpu_power.is_none();
 
         // Update current readings
-        self.cpu_power = sample.cpu_power;
-        self.gpu_power = sample.gpu_power;
-        self.total_power = sample.total_power;
+        self.cpu_power = sample.cpu_power_or_zero();
+        self.gpu_power = sample.gpu_power_or_zero();
+        self.total_power = sample.total_power();
         self.cpu_usage = sample.cpu_usage;
 
-        // Process/App Power
-        self.process_power = sample.process_power;
-        self.app_power = sample.app_power; // tuple (power, count)
+        // Power attributed to the PID or app being targeted
+        self.target_power = sample.target_power;
+        self.app_pid_count = sample.app_pid_count;
 
         // Add to history
-        if let Some(p) = self.process_power {
-            self.process_power_history.push(p);
-        }
-        if let Some((p, _)) = self.app_power {
-            self.app_power_history.push(p);
+        if let Some(p) = self.target_power {
+            match self.monitor_mode {
+                MonitorMode::Pid => self.process_power_history.push(p),
+                MonitorMode::App => self.app_power_history.push(p),
+                MonitorMode::Cpu => {}
+            }
         }
 
         // Update history
@@ -294,8 +301,13 @@ impl PowerGui {
         self.total_power_history.push(self.total_power);
         self.cpu_usage_history.push(self.cpu_usage);
 
-        if self.monitoring_active {
-            let _ = self.outputs.send(&sample);
+        if self.monitoring_active
+            && let Err(e) = self.outputs.send(&sample)
+        {
+            // A CSV file that can no longer be written would otherwise fail
+            // silently for the rest of the session.
+            self.output_error = Some(e.to_string());
+            self.monitoring_active = false;
         }
     }
 }
@@ -326,15 +338,7 @@ impl eframe::App for PowerGui {
     }
 }
 
-pub fn run_gui(
-    monitor: JoularCoreMonitor,
-    ringbuffer: Option<RingBufferWriter>,
-    api_sender: ApiSender,
-    api_shutdown_tx: ApiShutdownTx,
-    app_refresh_interval: u64,
-    initial_api_port: Option<u16>,
-    initial_allowed_origins: Vec<String>,
-) -> eframe::Result<()> {
+pub fn run_gui(monitor: JoularCoreMonitor, config: MonitorConfig, args: Args) -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([GUI_WIDTH, GUI_HEIGHT])
@@ -350,15 +354,7 @@ pub fn run_gui(
         native_options,
         Box::new(move |cc| {
             theme::install_fonts(&cc.egui_ctx);
-            Ok(Box::new(PowerGui::new(
-                monitor,
-                ringbuffer,
-                api_sender,
-                api_shutdown_tx,
-                app_refresh_interval,
-                initial_api_port,
-                initial_allowed_origins,
-            )))
+            Ok(Box::new(PowerGui::new(monitor, config, &args)))
         }),
     )
 }

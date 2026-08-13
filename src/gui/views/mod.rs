@@ -50,7 +50,6 @@ impl PowerGui {
         if self.state == crate::gui::model::ValidationState::Monitor {
             if Self::pill_button(&mut child, "Back", t.surface, t.border, t.text_pri).clicked() {
                 self.state = crate::gui::model::ValidationState::Options;
-                self.outputs.clear_writer();
                 self.monitoring_active = false;
                 self.reset_sampling_baseline();
                 self.cpu_power_history.clear();
@@ -60,21 +59,12 @@ impl PowerGui {
                 self.process_power_history.clear();
                 self.app_power_history.clear();
 
-                // Release the ring buffer so it can be re-created on next start.
-                if self.ringbuffer_committed {
-                    self.outputs.set_ringbuffer(None);
-                    self.ringbuffer_committed = false;
-                }
-
-                // Shut down the API server so the port is freed for reuse.
-                #[cfg(feature = "api")]
-                if self.api_committed {
-                    if let Some(tx) = self.api_shutdown_tx.take() {
-                        let _ = tx.send(());
-                    }
-                    self.outputs.set_api_sender(None);
-                    self.api_committed = false;
-                }
+                // Sinks cannot be detached from a bundle, so dropping the whole
+                // bundle is what closes the CSV file and releases the ring
+                // buffer mapping. Start builds a fresh one.
+                self.outputs = joularcore::OutputBundle::new();
+                self.ringbuffer_active = false;
+                self.output_error = None;
 
                 child
                     .ctx()

@@ -31,7 +31,7 @@ impl PowerGui {
         // Component filter: when the user picked "CPU only" / "GPU only" in
         // the options screen we hide the irrelevant cards entirely and report
         // the total as just the visible component, so the figures the user
-        // sees match what gets written to CSV / API / ring buffer.
+        // sees match what gets written to CSV / ring buffer.
         let show_cpu = !matches!(self.component_filter, Some(Component::Gpu));
         let show_gpu = !matches!(self.component_filter, Some(Component::Cpu));
 
@@ -43,8 +43,8 @@ impl PowerGui {
             None => self.total_power,
         };
         let cpu_usage = self.cpu_usage;
-        let process_power = self.process_power;
-        let app_power = self.app_power;
+        let target_power = self.target_power;
+        let app_pid_count = self.app_pid_count;
         let initialized = self.initialized;
         let monitoring_active = self.monitoring_active;
         let monitor_mode = self.monitor_mode;
@@ -65,8 +65,8 @@ impl PowerGui {
                 format!("Process {pid_input}")
             }
         };
-        let app_label = match app_power {
-            Some((_, count)) if !app_input.is_empty() => {
+        let app_label = match app_pid_count {
+            Some(count) if !app_input.is_empty() => {
                 format!("App: {app_input} ({count} PIDs)")
             }
             _ if !app_input.is_empty() => format!("App: {app_input}"),
@@ -123,33 +123,38 @@ impl PowerGui {
 
                         ui.add_space(12.0);
 
-                        if monitor_mode == MonitorMode::Pid
-                            && let Some(pid_pwr) = process_power
-                        {
+                        // The target card is drawn for the whole session rather
+                        // than only once a reading arrives. egui derives a
+                        // widget's id from how many widgets preceded it, and
+                        // this card is exactly one row tall — letting it appear
+                        // a tick after Start slid every card below it into the
+                        // slot of the card above, which egui reports as an id
+                        // that changed between passes. Until the first
+                        // attribution lands the card shows its "Loading…"
+                        // state, the same as the ones beside it.
+                        if monitor_mode == MonitorMode::Pid {
                             draw_metric_card(
                                 ui,
                                 &pid_label,
-                                pid_pwr,
+                                target_power.unwrap_or(0.0),
                                 "W",
                                 t.accent,
                                 &self.process_power_history,
-                                initialized,
+                                initialized && target_power.is_some(),
                                 &t,
                             );
                             ui.add_space(10.0);
                         }
 
-                        if monitor_mode == MonitorMode::App
-                            && let Some((app_pwr, _)) = app_power
-                        {
+                        if monitor_mode == MonitorMode::App {
                             draw_metric_card(
                                 ui,
                                 &app_label,
-                                app_pwr,
+                                target_power.unwrap_or(0.0),
                                 "W",
                                 t.accent,
                                 &self.app_power_history,
-                                initialized,
+                                initialized && target_power.is_some(),
                                 &t,
                             );
                             ui.add_space(10.0);
@@ -252,45 +257,64 @@ impl PowerGui {
                         }
                         ui.add_space(18.0);
 
-                        // ── Active-output info row ───────────────────────────
-                        let show_rb = self.ringbuffer_committed;
-                        #[cfg(feature = "api")]
-                        let api_url = if self.api_committed {
-                            self.api_port_input
-                                .trim()
-                                .parse::<u16>()
-                                .ok()
-                                .map(|p| format!("http://127.0.0.1:{}/data", p))
-                        } else {
-                            None
-                        };
-                        #[cfg(not(feature = "api"))]
-                        let api_url: Option<String> = None;
+                        // ── Warnings ─────────────────────────────────────────
+                        // A power interface is privileged on most systems. When
+                        // one cannot be read the gauge above shows 0.00 W, which
+                        // is indistinguishable from an idle machine — this is
+                        // the only thing that tells the two apart. Only warn
+                        // about a component the user is actually looking at.
+                        let warn_cpu = show_cpu && self.cpu_unavailable;
+                        let warn_gpu = show_gpu && self.gpu_unavailable;
 
-                        if show_rb || api_url.is_some() {
+                        if warn_cpu || warn_gpu || self.output_error.is_some() {
                             ui.add_space(4.0);
                             ui.separator();
                             ui.add_space(6.0);
 
-                            if show_rb {
-                                let path = joularcore::ringbuffer::RingBufferWriter::shared_path();
-
+                            if warn_cpu {
                                 ui.label(
-                                    RichText::new(format!("Ring buffer: {}", path))
-                                        .size(11.5)
-                                        .color(t.text_sec),
+                                    RichText::new(
+                                        "⚠ CPU power unavailable — elevated privileges may be required (see Advanced → Elevation).",
+                                    )
+                                    .size(11.5)
+                                    .color(t.danger),
                                 );
                             }
 
-                            if let Some(url) = api_url {
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new("API: ").size(11.5).color(t.text_sec));
-                                    ui.add(egui::Hyperlink::from_label_and_url(
-                                        RichText::new(&url).size(10.5).color(t.accent),
-                                        &url,
-                                    ));
-                                });
+                            if warn_gpu {
+                                ui.label(
+                                    RichText::new(
+                                        "⚠ GPU power unavailable — no readable GPU sensor was found.",
+                                    )
+                                    .size(11.5)
+                                    .color(t.danger),
+                                );
                             }
+
+                            if let Some(message) = &self.output_error {
+                                ui.label(
+                                    RichText::new(format!("⚠ Output stopped: {message}"))
+                                        .size(11.5)
+                                        .color(t.danger),
+                                );
+                            }
+
+                            ui.add_space(4.0);
+                        }
+
+                        // ── Active-output info row ───────────────────────────
+                        if self.ringbuffer_active {
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+
+                            let path = joularcore::ringbuffer::RingBufferWriter::default_path();
+
+                            ui.label(
+                                RichText::new(format!("Ring buffer: {}", path.display()))
+                                    .size(11.5)
+                                    .color(t.text_sec),
+                            );
 
                             ui.add_space(4.0);
                         }

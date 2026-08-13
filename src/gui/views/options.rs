@@ -13,8 +13,9 @@ use crate::gui::PowerGui;
 use crate::gui::model::MonitorMode;
 use crate::gui::model::ValidationState;
 use crate::gui::theme::tokens;
-use joularcore::Component;
-use joularcore::output::OutputWriter;
+use crate::session;
+use joularcore::ringbuffer::RingBufferWriter;
+use joularcore::{AppMatch, Component, ElevationPolicy, FileWriter, OutputBundle, Schema, Target};
 
 use eframe::egui;
 use eframe::egui::{Color32, RichText};
@@ -429,15 +430,11 @@ impl PowerGui {
                                     let response = PowerGui::toggle_ui(ui, &mut toggle);
                                     if response.changed() {
                                         self.ringbuffer_enabled = toggle;
-                                        if !toggle && self.ringbuffer_committed {
-                                            self.outputs.set_ringbuffer(None);
-                                            self.ringbuffer_committed = false;
-                                        }
                                     }
                                 },
                             );
                         });
-                        if self.ringbuffer_committed {
+                        if self.ringbuffer_active {
                             ui.label(
                                 RichText::new("(active)")
                                     .size(11.5)
@@ -448,18 +445,64 @@ impl PowerGui {
 
                         ui.add_space(14.0);
 
-                        // ── HTTP / WebSocket API toggle + port + origins ─────
-                        #[cfg(feature = "api")]
+                        // ── Application name matching ────────────────────────
+                        // How an --app name is matched against running
+                        // processes. The library only reads this while building
+                        // an app tracker, so a change here takes effect on the
+                        // next Start.
+                        ui.label(
+                            RichText::new("Application matching")
+                                .size(SUPPORT_TEXT_SIZE)
+                                .color(t.text_pri),
+                        );
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            for (label, value) in
+                                [("Exact", AppMatch::Exact), ("Contains", AppMatch::Contains)]
+                            {
+                                let selected = self.pending_config.app_match == value;
+                                let fill = if selected { t.accent } else { t.surface };
+                                let text_color = if selected { Color32::WHITE } else { t.text_pri };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new(label)
+                                                .size(SUPPORT_TEXT_SIZE)
+                                                .color(text_color),
+                                        )
+                                        .fill(fill)
+                                        .stroke(egui::Stroke::new(1.0_f32, t.border))
+                                        .corner_radius(10.0)
+                                        .min_size(egui::vec2(96.0, 28.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.pending_config.app_match = value;
+                                }
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(
+                                "\"Contains\" also catches helper processes (firefox → firefox-bin), but over-matches (code → codesign).",
+                            )
+                            .size(12.0)
+                            .color(t.text_ter),
+                        );
+
+                        ui.add_space(14.0);
+
+                        // ── Elevated sensor access ───────────────────────────
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
                                 ui.label(
-                                    RichText::new("HTTP / WebSocket API")
+                                    RichText::new("Elevated sensor access")
                                         .size(SUPPORT_TEXT_SIZE)
                                         .color(t.text_pri),
                                 );
                                 ui.label(
                                     RichText::new(
-                                        "Expose live samples on /data and /ws (localhost only).",
+                                        "Use `sudo -n` for sensors that need root. Never prompts, so run `sudo -v` first. Required for CPU power on macOS.",
                                     )
                                     .size(12.0)
                                     .color(t.text_ter),
@@ -468,155 +511,18 @@ impl PowerGui {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    let mut toggle = self.api_enabled;
-                                    let response = PowerGui::toggle_ui(ui, &mut toggle);
-                                    if response.changed() {
-                                        self.api_enabled = toggle;
-                                        if !toggle && self.api_committed {
-                                            if let Some(tx) = self.api_shutdown_tx.take() {
-                                                let _ = tx.send(());
-                                            }
-                                            self.outputs.set_api_sender(None);
-                                            self.api_committed = false;
-                                        }
+                                    let mut toggle = self.pending_config.elevation
+                                        == ElevationPolicy::SudoNonInteractive;
+                                    if PowerGui::toggle_ui(ui, &mut toggle).changed() {
+                                        self.pending_config.elevation = if toggle {
+                                            ElevationPolicy::SudoNonInteractive
+                                        } else {
+                                            ElevationPolicy::Never
+                                        };
                                     }
                                 },
                             );
                         });
-
-                        #[cfg(feature = "api")]
-                        if self.api_enabled {
-                            ui.add_space(8.0);
-                            ui.label(
-                                RichText::new("Port")
-                                    .size(SUPPORT_TEXT_SIZE)
-                                    .color(t.text_pri),
-                            );
-                            ui.add_space(4.0);
-                            styled_text_input(
-                                &mut self.api_port_input,
-                                "e.g. 8080",
-                                ui,
-                                ui.available_width(),
-                            );
-
-                            ui.add_space(10.0);
-                            ui.label(
-                                RichText::new("Allowed origins (extra)")
-                                    .size(SUPPORT_TEXT_SIZE)
-                                    .color(t.text_pri),
-                            );
-                            ui.label(
-                                RichText::new(
-                                    "Localhost is always allowed. Add more if a remote dashboard needs CORS access.",
-                                )
-                                .size(11.5)
-                                .color(t.text_ter),
-                            );
-                            ui.add_space(4.0);
-
-                            // Add-origin row.
-                            let mut origin_to_add: Option<String> = None;
-                            ui.horizontal(|ui| {
-                                let btn_w = 60.0;
-                                let input_w =
-                                    (ui.available_width() - btn_w - ui.spacing().item_spacing.x)
-                                        .max(60.0);
-                                let _resp = styled_text_input(
-                                    &mut self.api_origin_input,
-                                    "https://my-dashboard.example.com",
-                                    ui,
-                                    input_w,
-                                );
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new("Add")
-                                                .size(SUPPORT_TEXT_SIZE)
-                                                .color(t.text_pri),
-                                        )
-                                        .fill(t.surface)
-                                        .stroke(egui::Stroke::new(1.0_f32, t.border))
-                                        .corner_radius(10.0)
-                                        .min_size(egui::vec2(btn_w, 30.0)),
-                                    )
-                                    .clicked()
-                                    && !self.api_committed
-                                {
-                                    let trimmed = self.api_origin_input.trim().to_string();
-                                    if !trimmed.is_empty()
-                                        && !self.api_allowed_origins.contains(&trimmed)
-                                    {
-                                        origin_to_add = Some(trimmed);
-                                    }
-                                    self.api_origin_input.clear();
-                                }
-                            });
-                            if let Some(o) = origin_to_add {
-                                self.api_allowed_origins.push(o);
-                            }
-
-                            // Existing origins list with remove buttons.
-                            if self.api_allowed_origins.is_empty() {
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new("(no extra origins)")
-                                        .italics()
-                                        .size(12.0)
-                                        .color(t.text_ter),
-                                );
-                            } else {
-                                ui.add_space(4.0);
-                                let mut remove_idx: Option<usize> = None;
-                                for (i, origin) in self.api_allowed_origins.iter().enumerate() {
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new(origin)
-                                                .size(SUPPORT_TEXT_SIZE)
-                                                .color(t.text_sec),
-                                        );
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if !self.api_committed
-                                                    && ui
-                                                        .add(
-                                                            egui::Button::new(
-                                                                RichText::new("Remove")
-                                                                    .size(11.0)
-                                                                    .color(t.danger),
-                                                            )
-                                                            .fill(t.surface)
-                                                            .stroke(egui::Stroke::new(
-                                                                1.0_f32, t.border,
-                                                            ))
-                                                            .corner_radius(8.0),
-                                                        )
-                                                        .clicked()
-                                                {
-                                                    remove_idx = Some(i);
-                                                }
-                                            },
-                                        );
-                                    });
-                                }
-                                if let Some(i) = remove_idx {
-                                    self.api_allowed_origins.remove(i);
-                                }
-                            }
-
-                            if self.api_committed {
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new(
-                                        "(active — port and origins are locked until the server is restarted)",
-                                    )
-                                    .size(11.5)
-                                    .italics()
-                                    .color(t.text_ter),
-                                );
-                            }
-                        }
                     });
 
                     ui.add_space(20.0);
@@ -684,7 +590,7 @@ impl PowerGui {
                         ui.label(
                             RichText::new(format!(
                                 "Platform: {} · Version: {}",
-                                self.monitor.platform.name(),
+                                self.monitor.platform().name(),
                                 APP_VERSION
                             ))
                             .size(11.5)
@@ -903,12 +809,12 @@ impl PowerGui {
                 })
                 .inner;
 
-            if res.changed()
-                && let Some(tracker) = &mut self.monitor.app_tracker
-            {
-                tracker.set_refresh_interval(std::time::Duration::from_secs(
-                    self.app_refresh_interval,
-                ));
+            // An app tracker reads its refresh interval when it is created and
+            // never again, so this takes effect on the next Start, which builds
+            // a new monitor when it sees the interval has changed.
+            if res.changed() {
+                self.pending_config.app_refresh_interval =
+                    std::time::Duration::from_secs(self.app_refresh_interval);
             }
 
             let badge_text = if self.app_refresh_interval == 0 {
@@ -1006,6 +912,44 @@ impl PowerGui {
 
     fn handle_start_clicked(&mut self) {
         self.error_message = None;
+        self.output_error = None;
+
+        // ── Validate the target and turn it into a library target ────────
+        let target = match self.monitor_mode {
+            MonitorMode::Pid => {
+                let pid = match self.pid_input.trim().parse::<u32>() {
+                    Ok(pid) => pid,
+                    Err(_) => {
+                        self.error_message =
+                            Some("Invalid PID. Please enter a valid number.".to_string());
+                        return;
+                    }
+                };
+                if !self.pid_exists(pid) {
+                    self.error_message =
+                        Some(format!("PID {} not found. Please check and try again.", pid));
+                    return;
+                }
+                Target::Pid(pid)
+            }
+            MonitorMode::App => {
+                let app_name = self.app_input.trim().to_string();
+                if app_name.is_empty() {
+                    self.error_message =
+                        Some("App name is empty. Please enter a valid name.".to_string());
+                    return;
+                }
+                if !self.app_exists(&app_name) {
+                    self.error_message = Some(format!(
+                        "Application \"{}\" not found. Please check and try again.",
+                        app_name
+                    ));
+                    return;
+                }
+                Target::app(app_name)
+            }
+            MonitorMode::Cpu => Target::System,
+        };
 
         // Apply CPU idle baseline if the user typed one in (empty input = leave
         // the current value alone, e.g. one set by --calibrate-cpu-idle-baseline).
@@ -1013,7 +957,7 @@ impl PowerGui {
         if !trimmed_baseline.is_empty() {
             match trimmed_baseline.parse::<f64>() {
                 Ok(value) if value >= 0.0 && value.is_finite() => {
-                    self.monitor.set_cpu_idle_baseline(value);
+                    self.pending_config.cpu_idle_baseline = Some(value);
                 }
                 _ => {
                     self.error_message = Some(
@@ -1024,41 +968,39 @@ impl PowerGui {
             }
         }
 
-        // Apply the component filter (CPU only / GPU only / Both) to the
-        // CSV / numeric writers and downstream output paths.
-        self.outputs.set_component(self.component_filter);
+        self.pending_config.target = target;
+        self.pending_config.component = self.component_filter;
 
-        if self.monitor_mode == MonitorMode::Pid {
-            let pid = match self.pid_input.trim().parse::<u32>() {
-                Ok(pid) => pid,
-                Err(_) => {
-                    self.error_message =
-                        Some("Invalid PID. Please enter a valid number.".to_string());
-                    return;
-                }
-            };
-            if !self.pid_exists(pid) {
-                self.error_message = Some(format!(
-                    "PID {} not found. Please check and try again.",
-                    pid
-                ));
-                return;
+        // ── Apply the config to the monitor ──────────────────────────────
+        // `app_match`, `app_refresh_interval` and `elevation` are only read
+        // while the platform and its trackers are constructed, so changing any
+        // of them needs a new monitor. Everything else is settable in place,
+        // and rebuilding for it would re-prime every sensor for nothing.
+        let needs_rebuild = self.built_config.app_match != self.pending_config.app_match
+            || self.built_config.app_refresh_interval != self.pending_config.app_refresh_interval
+            || self.built_config.elevation != self.pending_config.elevation;
+
+        if needs_rebuild {
+            self.monitor = session::build_monitor(&self.pending_config);
+            self.built_config = self.pending_config.clone();
+        } else {
+            self.monitor.set_target(self.pending_config.target.clone());
+            self.monitor.set_component(self.pending_config.component);
+            if let Some(baseline) = self.pending_config.cpu_idle_baseline {
+                self.monitor.set_cpu_idle_baseline(baseline);
             }
-        } else if self.monitor_mode == MonitorMode::App {
-            let app_name = self.app_input.trim().to_string();
-            if app_name.is_empty() {
-                self.error_message =
-                    Some("App name is empty. Please enter a valid name.".to_string());
-                return;
-            }
-            if !self.app_exists(&app_name) {
-                self.error_message = Some(format!(
-                    "Application \"{}\" not found. Please check and try again.",
-                    app_name
-                ));
-                return;
-            }
+            self.built_config.target = self.pending_config.target.clone();
+            self.built_config.component = self.pending_config.component;
+            self.built_config.cpu_idle_baseline = self.pending_config.cpu_idle_baseline;
         }
+
+        // ── Outputs ──────────────────────────────────────────────────────
+        // Sinks cannot be detached from a bundle, so a session gets a fresh
+        // one. Assigning the empty bundle first is what drops the previous ring
+        // buffer mapping: creating a second writer for the same object fails
+        // while the old one is still alive.
+        self.outputs = OutputBundle::new();
+        self.ringbuffer_active = false;
 
         if self.csv_enabled {
             let Some(path) = &self.csv_path else {
@@ -1067,8 +1009,11 @@ impl PowerGui {
                 return;
             };
 
-            let mut writer = match OutputWriter::new(Some(path), false, self.csv_overwrite) {
-                Ok(w) => w,
+            // The schema derives its columns from the target and component, so
+            // it has to be built after the config above is settled.
+            let schema = Schema::csv(self.pending_config.component, &self.pending_config.target);
+            let mut writer = match FileWriter::open(path, schema, self.csv_overwrite) {
+                Ok(writer) => writer,
                 Err(e) => {
                     self.error_message =
                         Some(format!("Failed to open CSV file \"{}\": {}", path, e));
@@ -1076,79 +1021,22 @@ impl PowerGui {
                 }
             };
 
-            let has_process = self.monitor_mode == MonitorMode::Pid;
-            let has_app = self.monitor_mode == MonitorMode::App;
-            if let Err(e) = writer.write_csv_header(None, has_process, has_app) {
+            if let Err(e) = writer.write_header() {
                 self.error_message = Some(format!("Failed to write CSV header: {}", e));
                 return;
             }
 
-            self.outputs.set_writer(writer);
+            self.outputs.push(writer);
         }
 
-        // ── Lazy: ring buffer ────────────────────────────────────────────
-        // Only attempt to create a writer if the user toggled it on AND we
-        // haven't already committed one for this session.
-        if self.ringbuffer_enabled && !self.ringbuffer_committed {
-            match joularcore::ringbuffer::RingBufferWriter::new(true) {
+        if self.ringbuffer_enabled {
+            match RingBufferWriter::new() {
                 Ok(writer) => {
-                    self.outputs.set_ringbuffer(Some(writer));
-                    self.ringbuffer_committed = true;
+                    self.outputs.push(writer);
+                    self.ringbuffer_active = true;
                 }
                 Err(e) => {
                     self.error_message = Some(format!("Failed to enable the ring buffer: {}", e));
-                    return;
-                }
-            }
-        }
-
-        // ── Lazy: HTTP / WebSocket API server ────────────────────────────
-        #[cfg(feature = "api")]
-        if self.api_enabled && !self.api_committed {
-            let port_str = self.api_port_input.trim();
-            if port_str.is_empty() {
-                self.error_message = Some(
-                    "API is enabled, but no port is specified. Please enter a port between 1 and 65535."
-                        .to_string(),
-                );
-                return;
-            }
-            let port = match port_str.parse::<u16>() {
-                Ok(p) if p > 0 => p,
-                _ => {
-                    self.error_message = Some(format!(
-                        "API port \"{}\" is invalid. Please enter a number between 1 and 65535.",
-                        port_str
-                    ));
-                    return;
-                }
-            };
-
-            // Validate origins now so we never spawn the server with values
-            // tower-http would silently drop later.
-            for origin in &self.api_allowed_origins {
-                if axum::http::HeaderValue::from_str(origin).is_err() {
-                    self.error_message = Some(format!(
-                        "Allowed origin \"{}\" is not a valid value.",
-                        origin
-                    ));
-                    return;
-                }
-            }
-
-            let (tx, _rx) = tokio::sync::broadcast::channel(16);
-            match joularcore::common::spawn_api_server(port, self.api_allowed_origins.clone(), tx) {
-
-                Ok((sender, shutdown_tx)) => {
-                    self.outputs.set_api_sender(sender);
-                    self.api_shutdown_tx = shutdown_tx;
-                    self.api_committed = true;
-                }
-                Err(e) => {
-                    self.error_message = Some(format!(
-                        "Failed to start the API server on port {}: {}",
-                        port, e
-                    ));
                     return;
                 }
             }
