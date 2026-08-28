@@ -597,15 +597,15 @@ impl PowerGui {
                             .color(t.text_ter),
                         );
                         ui.label(
-                            RichText::new("Joular Core is a platform to measure power and energy across all systems, OSes and devices. Joular Core is licensed under the GNU GPL 3 license only (GPL-3.0-only).\nCopyright © 2025-2026, Adel Noureddine. All rights reserved.")
+                            RichText::new("Joular Core GUI Rustic is a platform to measure power and energy across all systems, OSes and devices. Joular Core GUI Rustic is licensed under the GNU GPL 3 license only (GPL-3.0-only).\nCopyright © 2025-2026, Adel Noureddine. All rights reserved.")
                                 .size(FOOTER_TEXT_SIZE)
                                 .color(t.text_ter),
                         );
                         ui.hyperlink_to(
-                            RichText::new("github.com/joular/joularcore")
+                            RichText::new("github.com/joular/joularcore-gui-rustic")
                                 .size(11.0)
                                 .color(t.accent),
-                            "https://github.com/joular/joularcore",
+                            "https://github.com/joular/joularcore-gui-rustic",
                         );
                     });
                     ui.add_space(14.0);
